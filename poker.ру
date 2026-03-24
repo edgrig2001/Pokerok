@@ -1,17 +1,15 @@
 import random
 import sqlite3
-import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils import executor
+import requests
+from flask import Flask, request
 
-TOKEN = "8608423670:AAEgC1ONJB6abqRFKLKsGpHnLSRIgFS9Keg"
+TOKEN = "ТВОЙ_ТОКЕН"
+URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+app = Flask(__name__)
 
-# ====== БАЗА ======
-conn = sqlite3.connect("db.sqlite3")
+# ===== БАЗА =====
+conn = sqlite3.connect("db.sqlite3", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, balance INTEGER)")
 conn.commit()
@@ -31,7 +29,7 @@ def update_balance(user_id, amount):
     conn.commit()
     return bal
 
-# ====== КАРТЫ ======
+# ===== КАРТЫ =====
 suits = ["♠", "♥", "♦", "♣"]
 ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 
@@ -40,67 +38,59 @@ def deck():
     random.shuffle(d)
     return d
 
-# ====== ОЦЕНКА РУКИ (упрощённая) ======
-def hand_strength(hand, table):
-    cards = hand + table
-    values = [ranks.index(c[:-1]) for c in cards]
+def strength(hand, table):
+    vals = [ranks.index(c[:-1]) for c in hand + table]
+    pairs = len(vals) - len(set(vals))
+    return pairs * 0.4 + max(vals)/14
 
-    pairs = len(values) - len(set(values))
-    high = max(values)
-
-    return pairs * 0.4 + high / 14
-
-# ====== ИГРЫ ======
 games = {}
 
-# ====== КНОПКИ ======
+# ===== TELEGRAM =====
+def send(chat_id, text, keyboard=None):
+    data = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if keyboard:
+        data["reply_markup"] = keyboard
+    requests.post(URL + "sendMessage", json=data)
+
+def edit(chat_id, msg_id, text, keyboard=None):
+    data = {
+        "chat_id": chat_id,
+        "message_id": msg_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+    if keyboard:
+        data["reply_markup"] = keyboard
+    requests.post(URL + "editMessageText", json=data)
+
 def keyboard():
-    kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("Check", callback_data="check"),
-        InlineKeyboardButton("Fold", callback_data="fold")
-    )
-    kb.add(
-        InlineKeyboardButton("Bet 50", callback_data="bet50"),
-        InlineKeyboardButton("Bet 100", callback_data="bet100"),
-        InlineKeyboardButton("All-in", callback_data="allin")
-    )
-    return kb
+    return {
+        "inline_keyboard": [
+            [{"text": "Check", "callback_data": "check"},
+             {"text": "Fold", "callback_data": "fold"}],
+            [{"text": "Bet 50", "callback_data": "bet50"},
+             {"text": "Bet 100", "callback_data": "bet100"}],
+            [{"text": "All-in", "callback_data": "allin"}]
+        ]
+    }
 
-# ====== СТАРТ ======
-@dp.message_handler(commands=["start"])
-async def start(msg: types.Message):
-    bal = get_balance(msg.from_user.id)
-    kb = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("Играть", callback_data="play")
-    )
-    await msg.answer(f"💰 Баланс: {bal}\n\nНачать игру?", reply_markup=kb)
-
-# ====== НАЧАЛО ======
-@dp.callback_query_handler(lambda c: c.data == "play")
-async def play(callback: types.CallbackQuery):
+# ===== ИГРА =====
+def start_game(user_id):
     d = deck()
-
-    player = [d.pop(), d.pop()]
-    bots = [[d.pop(), d.pop()] for _ in range(3)]
-
-    game = {
+    games[user_id] = {
         "deck": d,
-        "player": player,
-        "bots": bots,
+        "player": [d.pop(), d.pop()],
+        "bots": [[d.pop(), d.pop()] for _ in range(3)],
         "table": [],
         "stage": "preflop",
         "bet": 0
     }
 
-    games[callback.from_user.id] = game
-
-    await next_stage(callback.from_user.id, callback.message)
-
-# ====== ЭТАПЫ ======
-async def next_stage(user_id, message):
-    game = games[user_id]
-
+def next_stage(game):
     if game["stage"] == "preflop":
         game["table"] = [game["deck"].pop() for _ in range(3)]
         game["stage"] = "flop"
@@ -111,96 +101,79 @@ async def next_stage(user_id, message):
         game["table"].append(game["deck"].pop())
         game["stage"] = "river"
     else:
-        await showdown(user_id, message)
-        return
+        return True
+    return False
 
-    await show_game(user_id, message)
+# ===== WEBHOOK =====
+@app.route("/", methods=["POST"])
+def webhook():
+    data = request.json
 
-# ====== ОТОБРАЖЕНИЕ ======
-async def show_game(user_id, message):
-    game = games[user_id]
+    if "message" in data:
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        user_id = msg["from"]["id"]
 
-    text = f"""
-🃏 Твои карты: {' '.join(game['player'])}
+        if msg.get("text") == "/start":
+            bal = get_balance(user_id)
+            send(chat_id, f"💰 Баланс: {bal}", {
+                "inline_keyboard":[[{"text":"Играть","callback_data":"play"}]]
+            })
 
-🪟 Стол: {' '.join(game['table'])}
+    if "callback_query" in data:
+        cb = data["callback_query"]
+        user_id = cb["from"]["id"]
+        chat_id = cb["message"]["chat"]["id"]
+        msg_id = cb["message"]["message_id"]
+        action = cb["data"]
 
-💰 Текущая ставка: {game['bet']}
+        if action == "play":
+            start_game(user_id)
+            game = games[user_id]
+            text = f"🃏 {game['player']}\n\nСтол: {game['table']}"
+            edit(chat_id, msg_id, text, keyboard())
 
-Твой ход:
-"""
-    await message.edit_text(text, reply_markup=keyboard())
+        elif user_id in games:
+            game = games[user_id]
 
-    asyncio.create_task(auto_fold(user_id, message))
+            if action == "fold":
+                update_balance(user_id, -50)
+                edit(chat_id, msg_id, "❌ Ты сбросил (-50)")
+                del games[user_id]
+                return "ok"
 
-# ====== ТАЙМЕР ======
-async def auto_fold(user_id, message):
-    await asyncio.sleep(15)
-    if user_id in games:
-        await message.edit_text("⏱ Время вышло! Ты сбросил.")
-        del games[user_id]
+            if "bet" in action:
+                game["bet"] += int(action.replace("bet",""))
 
-# ====== ХОД ======
-@dp.callback_query_handler(lambda c: c.data.startswith(("check","fold","bet","allin")))
-async def action(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    game = games.get(user_id)
+            if action == "allin":
+                game["bet"] += get_balance(user_id)
 
-    if not game:
-        return
+            # боты
+            for b in game["bots"]:
+                s = strength(b, game["table"])
+                # просто логика
 
-    if callback.data == "fold":
-        update_balance(user_id, -50)
-        await callback.message.edit_text("❌ Ты сбросил (-50)")
-        del games[user_id]
-        return
+            finished = next_stage(game)
 
-    if "bet" in callback.data:
-        bet = int(callback.data.replace("bet",""))
-        game["bet"] += bet
+            if finished:
+                player = strength(game["player"], game["table"])
+                bots = max([strength(b, game["table"]) for b in game["bots"]])
 
-    if callback.data == "allin":
-        bet = get_balance(user_id)
-        game["bet"] += bet
+                if player > bots:
+                    update_balance(user_id, 100)
+                    result = "🎉 Победа"
+                else:
+                    update_balance(user_id, -50)
+                    result = "😢 Поражение"
 
-    # ====== БОТЫ ======
-    bot_actions = []
-    for b in game["bots"]:
-        strength = hand_strength(b, game["table"])
-        if strength > 0.7:
-            bot_actions.append("raise")
-        elif strength > 0.4:
-            bot_actions.append("call")
-        else:
-            bot_actions.append("fold")
+                edit(chat_id, msg_id, result)
+                del games[user_id]
+            else:
+                text = f"🃏 {game['player']}\n\nСтол: {game['table']}"
+                edit(chat_id, msg_id, text, keyboard())
 
-    await next_stage(user_id, callback.message)
+    return "ok"
 
-# ====== ФИНАЛ ======
-async def showdown(user_id, message):
-    game = games[user_id]
-
-    player_score = hand_strength(game["player"], game["table"])
-    bot_scores = [hand_strength(b, game["table"]) for b in game["bots"]]
-
-    if player_score > max(bot_scores):
-        win = game["bet"] + 100
-        update_balance(user_id, win)
-        result = f"🎉 Ты выиграл +{win}"
-    else:
-        update_balance(user_id, -50)
-        result = "😢 Ты проиграл -50"
-
-    text = f"""
-🃏 Твои карты: {' '.join(game['player'])}
-🪟 Стол: {' '.join(game['table'])}
-
-{result}
-"""
-    await message.edit_text(text)
-
-    del games[user_id]
-
-# ====== ЗАПУСК ======
+# ===== ЗАПУСК =====
 if __name__ == "__main__":
-    executor.start_polling(dp)
+    app.run()
