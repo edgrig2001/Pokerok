@@ -1,0 +1,206 @@
+import random
+import sqlite3
+import asyncio
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+
+TOKEN = "ТВОЙ_ТОКЕН"
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
+
+# ====== БАЗА ======
+conn = sqlite3.connect("db.sqlite3")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, balance INTEGER)")
+conn.commit()
+
+def get_balance(user_id):
+    cursor.execute("SELECT balance FROM users WHERE id=?", (user_id,))
+    row = cursor.fetchone()
+    if row:
+        return row[0]
+    cursor.execute("INSERT INTO users VALUES (?, ?)", (user_id, 1000))
+    conn.commit()
+    return 1000
+
+def update_balance(user_id, amount):
+    bal = max(0, get_balance(user_id) + amount)
+    cursor.execute("UPDATE users SET balance=? WHERE id=?", (bal, user_id))
+    conn.commit()
+    return bal
+
+# ====== КАРТЫ ======
+suits = ["♠", "♥", "♦", "♣"]
+ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+
+def deck():
+    d = [r + s for s in suits for r in ranks]
+    random.shuffle(d)
+    return d
+
+# ====== ОЦЕНКА РУКИ (упрощённая) ======
+def hand_strength(hand, table):
+    cards = hand + table
+    values = [ranks.index(c[:-1]) for c in cards]
+
+    pairs = len(values) - len(set(values))
+    high = max(values)
+
+    return pairs * 0.4 + high / 14
+
+# ====== ИГРЫ ======
+games = {}
+
+# ====== КНОПКИ ======
+def keyboard():
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("Check", callback_data="check"),
+        InlineKeyboardButton("Fold", callback_data="fold")
+    )
+    kb.add(
+        InlineKeyboardButton("Bet 50", callback_data="bet50"),
+        InlineKeyboardButton("Bet 100", callback_data="bet100"),
+        InlineKeyboardButton("All-in", callback_data="allin")
+    )
+    return kb
+
+# ====== СТАРТ ======
+@dp.message_handler(commands=["start"])
+async def start(msg: types.Message):
+    bal = get_balance(msg.from_user.id)
+    kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("Играть", callback_data="play")
+    )
+    await msg.answer(f"💰 Баланс: {bal}\n\nНачать игру?", reply_markup=kb)
+
+# ====== НАЧАЛО ======
+@dp.callback_query_handler(lambda c: c.data == "play")
+async def play(callback: types.CallbackQuery):
+    d = deck()
+
+    player = [d.pop(), d.pop()]
+    bots = [[d.pop(), d.pop()] for _ in range(3)]
+
+    game = {
+        "deck": d,
+        "player": player,
+        "bots": bots,
+        "table": [],
+        "stage": "preflop",
+        "bet": 0
+    }
+
+    games[callback.from_user.id] = game
+
+    await next_stage(callback.from_user.id, callback.message)
+
+# ====== ЭТАПЫ ======
+async def next_stage(user_id, message):
+    game = games[user_id]
+
+    if game["stage"] == "preflop":
+        game["table"] = [game["deck"].pop() for _ in range(3)]
+        game["stage"] = "flop"
+    elif game["stage"] == "flop":
+        game["table"].append(game["deck"].pop())
+        game["stage"] = "turn"
+    elif game["stage"] == "turn":
+        game["table"].append(game["deck"].pop())
+        game["stage"] = "river"
+    else:
+        await showdown(user_id, message)
+        return
+
+    await show_game(user_id, message)
+
+# ====== ОТОБРАЖЕНИЕ ======
+async def show_game(user_id, message):
+    game = games[user_id]
+
+    text = f"""
+🃏 Твои карты: {' '.join(game['player'])}
+
+🪟 Стол: {' '.join(game['table'])}
+
+💰 Текущая ставка: {game['bet']}
+
+Твой ход:
+"""
+    await message.edit_text(text, reply_markup=keyboard())
+
+    asyncio.create_task(auto_fold(user_id, message))
+
+# ====== ТАЙМЕР ======
+async def auto_fold(user_id, message):
+    await asyncio.sleep(15)
+    if user_id in games:
+        await message.edit_text("⏱ Время вышло! Ты сбросил.")
+        del games[user_id]
+
+# ====== ХОД ======
+@dp.callback_query_handler(lambda c: c.data.startswith(("check","fold","bet","allin")))
+async def action(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    game = games.get(user_id)
+
+    if not game:
+        return
+
+    if callback.data == "fold":
+        update_balance(user_id, -50)
+        await callback.message.edit_text("❌ Ты сбросил (-50)")
+        del games[user_id]
+        return
+
+    if "bet" in callback.data:
+        bet = int(callback.data.replace("bet",""))
+        game["bet"] += bet
+
+    if callback.data == "allin":
+        bet = get_balance(user_id)
+        game["bet"] += bet
+
+    # ====== БОТЫ ======
+    bot_actions = []
+    for b in game["bots"]:
+        strength = hand_strength(b, game["table"])
+        if strength > 0.7:
+            bot_actions.append("raise")
+        elif strength > 0.4:
+            bot_actions.append("call")
+        else:
+            bot_actions.append("fold")
+
+    await next_stage(user_id, callback.message)
+
+# ====== ФИНАЛ ======
+async def showdown(user_id, message):
+    game = games[user_id]
+
+    player_score = hand_strength(game["player"], game["table"])
+    bot_scores = [hand_strength(b, game["table"]) for b in game["bots"]]
+
+    if player_score > max(bot_scores):
+        win = game["bet"] + 100
+        update_balance(user_id, win)
+        result = f"🎉 Ты выиграл +{win}"
+    else:
+        update_balance(user_id, -50)
+        result = "😢 Ты проиграл -50"
+
+    text = f"""
+🃏 Твои карты: {' '.join(game['player'])}
+🪟 Стол: {' '.join(game['table'])}
+
+{result}
+"""
+    await message.edit_text(text)
+
+    del games[user_id]
+
+# ====== ЗАПУСК ======
+if __name__ == "__main__":
+    executor.start_polling(dp)
