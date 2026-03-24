@@ -3,7 +3,7 @@ import sqlite3
 import requests
 from flask import Flask, request
 
-TOKEN = "ТВОЙ_ТОКЕН"
+TOKEN = "8608423670:AAEgC1ONJB6abqRFKLKsGpHnLSRIgFS9Keg"
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
 app = Flask(__name__)
